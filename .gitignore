@@ -1,0 +1,6 @@
+.venv/
+data/
+.api-key
+__pycache__/
+*.zip
+.env

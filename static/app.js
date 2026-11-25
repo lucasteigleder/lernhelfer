@@ -1,0 +1,802 @@
+"use strict";
+
+const COLORS = ["#8b5cf6", "#22d3ee", "#34d399", "#f472b6", "#fb923c", "#facc15", "#60a5fa", "#f87171"];
+const KINDS = { summary: "Zusammenfassung", quiz: "Quiz", flashcards: "Karteikarten", exam: "Probeklausur" };
+const $ = (s, el = document) => el.querySelector(s);
+const main = $("#main");
+
+const state = { subjects: [], current: null, pollTimer: null, quiz: null, fc: null };
+
+/* ---------------------------------------------------------------- helpers */
+async function api(path, opts = {}) {
+  const o = { ...opts };
+  if (o.json !== undefined) {
+    o.method = o.method || "POST";
+    o.headers = { "Content-Type": "application/json" };
+    o.body = JSON.stringify(o.json);
+  }
+  const r = await fetch("/api" + path, o);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `Fehler ${r.status}`);
+  return data;
+}
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+function toast(msg, ms = 2800) {
+  const t = $("#toast");
+  t.textContent = msg;
+  t.classList.add("show");
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => t.classList.remove("show"), ms);
+}
+function daysUntil(date) {
+  if (!date) return null;
+  const d = new Date(date + "T00:00:00");
+  const now = new Date(); now.setHours(0, 0, 0, 0);
+  return Math.round((d - now) / 86400000);
+}
+function daysLabel(n) {
+  if (n === null) return "";
+  if (n < 0) return "vorbei";
+  if (n === 0) return "heute!";
+  if (n === 1) return "morgen";
+  return `in ${n} Tagen`;
+}
+function fmtDate(date) {
+  return date ? new Date(date + "T00:00:00").toLocaleDateString("de-DE", { weekday: "short", day: "2-digit", month: "long" }) : "";
+}
+function fmtSize(b) {
+  return b > 1e6 ? (b / 1e6).toFixed(1) + " MB" : Math.max(1, Math.round(b / 1e3)) + " KB";
+}
+// Markdown + LaTeX: Mathe vor marked schützen, danach mit KaTeX rendern
+function renderMd(md, el) {
+  const math = [];
+  let src = String(md || "").replace(/\$\$([\s\S]+?)\$\$|\\\[([\s\S]+?)\\\]|\$([^\s$][^$\n]*?)\$|\\\(([\s\S]+?)\\\)/g, (m) => {
+    math.push(m);
+    return `@@MATH${math.length - 1}@@`;
+  });
+  let html = window.marked && window.DOMPurify
+    ? DOMPurify.sanitize(marked.parse(src, { gfm: true, breaks: false }))
+    : `<p>${esc(src).replace(/\n/g, "<br>")}</p>`;
+  html = html.replace(/@@MATH(\d+)@@/g, (_, i) => esc(math[+i]));
+  el.innerHTML = html;
+  if (window.renderMathInElement) {
+    renderMathInElement(el, {
+      delimiters: [
+        { left: "$$", right: "$$", display: true }, { left: "\\[", right: "\\]", display: true },
+        { left: "$", right: "$", display: false }, { left: "\\(", right: "\\)", display: false },
+      ],
+      throwOnError: false,
+    });
+  }
+  return el;
+}
+function mdInline(md) {
+  const d = document.createElement("div");
+  renderMd(md, d);
+  return d.innerHTML;
+}
+function shuffle(a) {
+  a = [...a];
+  for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; }
+  return a;
+}
+
+/* ---------------------------------------------------------------- sidebar */
+async function loadSubjects() {
+  state.subjects = await api("/subjects");
+  renderSidebar();
+}
+function renderSidebar() {
+  const list = $("#subjectList");
+  const cur = state.current?.id;
+  list.innerHTML = state.subjects.length ? "" : `<div class="muted" style="padding:6px;font-size:13px">Noch keine Fächer.</div>`;
+  for (const s of state.subjects) {
+    const n = daysUntil(s.exam_date);
+    const b = document.createElement("button");
+    b.className = "sub-item" + (s.id === cur ? " active" : "");
+    b.innerHTML = `<span class="dot" style="color:${esc(s.color)};background:${esc(s.color)}"></span>
+      <span class="nm">${esc(s.name)}</span>
+      ${n !== null ? `<span class="days ${n >= 0 && n <= 3 ? "soon" : ""}">${n < 0 ? "✓" : n + "T"}</span>` : ""}`;
+    b.onclick = () => (location.hash = `#/s/${s.id}`);
+    list.appendChild(b);
+  }
+}
+async function checkApi() {
+  try {
+    const h = await api("/health");
+    if ((h.version || 0) < 5) {
+      state.oldServer = true;
+      document.body.insertAdjacentHTML("afterbegin", `<div class="old-server">⚠️ <b>Im Hintergrund läuft noch der alte Lernhelfer.</b>
+        Schließe <b>alle</b> schwarzen Lernhelfer-Fenster (oder beende im Task-Manager mit Strg+Shift+Esc alle „Python“-Einträge),
+        starte dann <b>start.bat</b> neu und drücke hier <b>Strg+F5</b>.</div>`);
+    }
+    $("#apiState").innerHTML = h.api_key
+      ? `<span class="ok">●</span> KI verbunden · ${esc(h.model)}`
+      : `<span class="no">●</span> Kein API-Schlüssel gesetzt`;
+  } catch { $("#apiState").innerHTML = `<span class="no">●</span> Server nicht erreichbar`; }
+}
+
+/* ---------------------------------------------------------------- dialog */
+function openSubjectDialog(subject = null) {
+  const dlg = $("#subjectDialog"), f = $("#subjectForm");
+  $("#subjectDialogTitle").textContent = subject ? "Fach bearbeiten" : "Neues Fach";
+  f.name.value = subject?.name || "";
+  f.topic.value = subject?.topic || "";
+  f.exam_date.value = subject?.exam_date || "";
+  f.grade.value = subject?.grade || "";
+  let color = subject?.color || COLORS[state.subjects.length % COLORS.length];
+  const picker = $("#colorPicker");
+  picker.innerHTML = "";
+  for (const c of COLORS) {
+    const b = document.createElement("button");
+    b.type = "button"; b.style.background = c;
+    b.className = c === color ? "sel" : "";
+    b.onclick = () => { color = c; [...picker.children].forEach(x => x.classList.toggle("sel", x === b)); };
+    picker.appendChild(b);
+  }
+  $("#subjectCancel").onclick = () => dlg.close();
+  f.onsubmit = async (e) => {
+    e.preventDefault();
+    const body = { name: f.name.value, topic: f.topic.value, exam_date: f.exam_date.value || null, grade: f.grade.value, color };
+    try {
+      const s = subject
+        ? await api(`/subjects/${subject.id}`, { method: "PATCH", json: body })
+        : await api("/subjects", { json: body });
+      dlg.close();
+      await loadSubjects();
+      if (subject) route(); else location.hash = `#/s/${s.id}/files`;
+    } catch (err) { toast(err.message); }
+  };
+  dlg.showModal();
+  f.name.focus();
+}
+
+/* ---------------------------------------------------------------- home */
+function renderHome() {
+  state.current = null;
+  document.documentElement.style.setProperty("--sub", "#8b5cf6");
+  renderSidebar();
+  if (!state.subjects.length) {
+    main.innerHTML = `<div class="card empty" style="margin-top:40px">
+      <div class="em">📚</div><h2>Willkommen beim Lernhelfer</h2>
+      <p>Lege ein Fach an, lade deine Lernzettel, Folien oder Fotos hoch –<br>
+      und bekomme automatisch eine Zusammenfassung, ein Quiz und Karteikarten.</p>
+      <button class="btn primary" id="emptyNew">＋ Erstes Fach anlegen</button></div>`;
+    $("#emptyNew").onclick = () => openSubjectDialog();
+    return;
+  }
+  const upcoming = state.subjects.filter(s => daysUntil(s.exam_date) >= 0);
+  const next = upcoming[0];
+  main.innerHTML = `
+    <div class="page-head"><div>
+      <h1>Deine Klassenarbeiten</h1>
+      <div class="sub">${next ? `Als Nächstes: <b>${esc(next.name)}</b> ${daysLabel(daysUntil(next.exam_date))}` : "Keine anstehenden Termine eingetragen."}</div>
+    </div></div>
+    <div class="grid cols3" id="tiles"></div>`;
+  const tiles = $("#tiles");
+  for (const s of state.subjects) {
+    const n = daysUntil(s.exam_date);
+    const pct = s.card_count ? Math.round((s.cards_mastered / s.card_count) * 100) : 0;
+    const el = document.createElement("div");
+    el.className = "card tile";
+    el.style.setProperty("--c", s.color);
+    el.innerHTML = `
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px">
+        <div style="min-width:0"><h3>${esc(s.name)}</h3><div class="topic">${esc(s.topic || "")}</div></div>
+        ${n !== null && n >= 0 ? `<div style="text-align:right"><div class="big-days">${n}</div><div class="muted" style="font-size:12px">${n === 1 ? "Tag" : "Tage"}</div></div>` : ""}
+      </div>
+      <div class="meta">
+        ${s.exam_date ? `<span class="chip ${n !== null && n >= 0 && n <= 3 ? "hot" : ""}">📅 ${fmtDate(s.exam_date)}</span>` : ""}
+        <span class="chip">📄 ${s.file_count} Dateien</span>
+        ${s.card_count ? `<span class="chip">🃏 ${pct}% gelernt</span>` : ""}
+        ${s.last_result ? `<span class="chip">🎯 ${s.last_result.score}/${s.last_result.total}</span>` : ""}
+      </div>
+      ${s.card_count ? `<div class="bar"><i style="width:${pct}%"></i></div>` : ""}`;
+    el.onclick = () => (location.hash = `#/s/${s.id}`);
+    tiles.appendChild(el);
+  }
+}
+
+/* ---------------------------------------------------------------- subject */
+async function renderSubject(id, tab, sub) {
+  let s;
+  try { s = await api(`/subjects/${id}`); } catch { location.hash = "#/"; return; }
+  state.current = s;
+  document.documentElement.style.setProperty("--sub", s.color);
+  renderSidebar();
+  if (!tab) tab = s.has_summary ? "overview" : "files";
+  const n = daysUntil(s.exam_date);
+  const running = Object.values(s.status || {}).some(x => x.state === "running");
+  main.innerHTML = `
+    <div class="page-head">
+      <div>
+        <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap">
+          ${s.exam_date ? `<span class="chip ${n >= 0 && n <= 3 ? "hot" : n >= 0 && n <= 7 ? "warn" : ""}">📅 ${fmtDate(s.exam_date)} · ${daysLabel(n)}</span>` : ""}
+          ${s.grade ? `<span class="chip">Klasse ${esc(s.grade)}</span>` : ""}
+          ${running ? `<span class="chip"><span class="spinner" style="width:11px;height:11px"></span> KI arbeitet …</span>` : ""}
+        </div>
+        <h1>${esc(s.name)}</h1>
+        ${s.topic ? `<div class="sub">${esc(s.topic)}</div>` : ""}
+      </div>
+      <div style="display:flex;gap:8px">
+        <button class="btn sm" id="editSub">✎ Bearbeiten</button>
+        <button class="btn sm danger" id="delSub">🗑</button>
+      </div>
+    </div>
+    <div class="tabs">
+      ${[["overview", "Übersicht"], ["files", "Dateien", s.file_count], ["summary", "Zusammenfassung"],
+         ["quiz", "Quiz", s.quiz_count], ["flashcards", "Karteikarten", s.card_count], ["exam", "📝 Probeklausur", s.exam_count], ["chat", "💬 Chat"]]
+        .map(([k, l, c]) => `<button class="tab ${k === tab ? "active" : ""}" data-tab="${k}">${l}${c ? `<span class="badge">${c}</span>` : ""}</button>`).join("")}
+    </div>
+    <div id="view"></div>`;
+  main.querySelectorAll(".tab").forEach(b => (b.onclick = () => (location.hash = `#/s/${id}/${b.dataset.tab}`)));
+  $("#editSub").onclick = () => openSubjectDialog(s);
+  $("#delSub").onclick = async () => {
+    if (!confirm(`„${s.name}“ mit allen Dateien und Lernmaterialien löschen?`)) return;
+    await api(`/subjects/${id}`, { method: "DELETE" });
+    await loadSubjects();
+    location.hash = "#/";
+  };
+  const view = $("#view");
+  ({ overview: viewOverview, files: viewFiles, summary: viewSummary, quiz: viewQuiz, flashcards: viewFlashcards, chat: viewChat, exam: viewExam }[tab] || viewOverview)(s, view, sub);
+  schedulePoll(s);
+}
+
+function schedulePoll(s) {
+  clearTimeout(state.pollTimer);
+  const running = Object.entries(s.status || {}).filter(([, v]) => v.state === "running").map(([k]) => k);
+  if (!running.length) return;
+  state.pollTimer = setTimeout(async () => {
+    if (state.current?.id !== s.id) return;
+    const fresh = await api(`/subjects/${s.id}`).catch(() => null);
+    if (!fresh) return;
+    const nowRunning = Object.values(fresh.status || {}).some(v => v.state === "running");
+    const finished = running.filter(k => fresh.status[k]?.state !== "running");
+    if (finished.length) {
+      finished.forEach(k => fresh.status[k].state === "done" ? toast(`✨ ${KINDS[k]} ist fertig!`) : toast(`⚠️ ${KINDS[k]}: ${fresh.status[k].error}`));
+      loadSubjects();
+      // Ansicht nur neu aufbauen, wenn der Nutzer nicht gerade ein Quiz/Karteikarten macht
+      const tab = location.hash.split("/")[3];
+      if (tab !== "chat" && !state.examActive && (!["quiz", "flashcards"].includes(tab) || !(state.quiz?.active || state.fc?.active))) route();
+      else schedulePoll(fresh);
+    } else if (nowRunning) schedulePoll(fresh);
+  }, 3000);
+}
+
+async function startGenerate(s, kinds) {
+  try {
+    await api(`/subjects/${s.id}/generate`, { json: { kinds } });
+    toast("🧠 Die KI liest dein Material … das dauert 1–3 Minuten.");
+    route();
+  } catch (e) { toast(e.message); }
+}
+
+function statusChips(s) {
+  return ["summary", "quiz", "flashcards"].map(k => [k, KINDS[k]]).map(([k, l]) => {
+    const st = s.status?.[k]?.state;
+    const has = k === "summary" ? s.has_summary : k === "quiz" ? s.quiz_count : s.card_count;
+    if (st === "running") return `<span class="chip"><span class="spinner" style="width:11px;height:11px"></span> ${l}</span>`;
+    if (st === "error") return `<span class="chip hot" title="${esc(s.status[k].error)}">⚠ ${l}</span>`;
+    return `<span class="chip">${has ? "✅" : "○"} ${l}</span>`;
+  }).join("");
+}
+function generatingCard(s, kind) {
+  const st = s.status?.[kind];
+  if (st?.state === "running") return `<div class="card loading-card"><div class="spinner"></div><h3>${KINDS[kind]} wird erstellt …</h3><p class="muted">Die KI liest dein Material. Das dauert meist 1–3 Minuten – du kannst so lange woanders lernen.</p></div>`;
+  return "";
+}
+function errorBox(s, kind) {
+  const st = s.status?.[kind];
+  return st?.state === "error" ? `<div class="err">⚠️ ${esc(st.error)}</div>` : "";
+}
+function emptyState(s, kind, emoji, text) {
+  const noFiles = !s.file_count;
+  return `<div class="card empty"><div class="em">${emoji}</div><h2>Noch keine ${KINDS[kind]}</h2>
+    <p>${noFiles ? "Lade zuerst deine Lernmaterialien hoch." : text}</p>
+    ${noFiles ? `<button class="btn primary" onclick="location.hash='#/s/${s.id}/files'">📄 Dateien hochladen</button>`
+              : `<button class="btn primary" data-gen="${kind}">✨ ${KINDS[kind]} erstellen</button>`}
+    ${errorBox(s, kind)}</div>`;
+}
+function bindGen(s, root) {
+  root.querySelectorAll("[data-gen]").forEach(b => (b.onclick = () => startGenerate(s, b.dataset.gen.split(","))));
+}
+
+/* ---------------------------------------------------------------- overview */
+function viewOverview(s, view) {
+  const pct = s.card_count ? Math.round((s.cards_mastered / s.card_count) * 100) : 0;
+  const res = s.results || [];
+  const avg = res.length ? Math.round(res.reduce((a, r) => a + r.score / Math.max(1, r.total), 0) / res.length * 100) : null;
+  const n = daysUntil(s.exam_date);
+  const wrong = {};
+  res.slice(-5).forEach(r => (r.wrong_topics || []).forEach(t => (wrong[t] = (wrong[t] || 0) + 1)));
+  const weak = Object.entries(wrong).sort((a, b) => b[1] - a[1]).slice(0, 5);
+  view.innerHTML = `
+    <div class="grid stats">
+      <div class="card stat"><div class="n">${n === null ? "–" : n < 0 ? "✓" : n}</div><div class="l">${n === null ? "kein Datum" : n < 0 ? "Arbeit vorbei" : "Tage bis zur Arbeit"}</div></div>
+      <div class="card stat"><div class="n">${s.file_count}</div><div class="l">Dateien</div></div>
+      <div class="card stat"><div class="n">${pct}%</div><div class="l">Karteikarten sicher</div><div class="bar"><i style="width:${pct}%"></i></div></div>
+      <div class="card stat"><div class="n">${avg === null ? "–" : avg + "%"}</div><div class="l">Ø Quiz (${res.length} Versuche)</div></div>
+    </div>
+    <div class="grid cols3" style="margin-top:16px">
+      <div class="card tile" style="--c:var(--accent)" onclick="location.hash='#/s/${s.id}/summary'"><h3>📖 Zusammenfassung</h3><div class="topic">Alle Themen erklärt, mit Beispielen und Merkzettel.</div><div class="meta">${s.has_summary ? `<span class="chip">✅ bereit</span>` : `<span class="chip">○ noch nicht erstellt</span>`}</div></div>
+      <div class="card tile" style="--c:var(--accent2)" onclick="location.hash='#/s/${s.id}/quiz'"><h3>🎯 Quiz</h3><div class="topic">Teste dein Wissen mit Multiple-Choice-Fragen.</div><div class="meta"><span class="chip">${s.quiz_count} Fragen</span></div></div>
+      <div class="card tile" style="--c:var(--good)" onclick="location.hash='#/s/${s.id}/flashcards'"><h3>🃏 Karteikarten</h3><div class="topic">Begriffe & Fakten nach dem Lernkartei-Prinzip.</div><div class="meta"><span class="chip">${s.card_count} Karten</span></div></div>
+      <div class="card tile" style="--c:#f472b6" onclick="location.hash='#/s/${s.id}/chat'"><h3>💬 Chat</h3><div class="topic">Stell der KI Fragen zu deinem Stoff oder lass dich abfragen.</div><div class="meta"><span class="chip">kennt alle ${s.file_count} Dateien</span></div></div>
+      <div class="card tile" style="--c:#fb923c" onclick="location.hash='#/s/${s.id}/exam'"><h3>📝 Probeklausur</h3><div class="topic">Realistische Klassenarbeit mit Timer – die KI korrigiert und gibt dir eine Note.</div><div class="meta"><span class="chip">${s.exam_count || 0} geschrieben</span></div></div>
+    </div>
+    ${weak.length ? `<div class="card" style="margin-top:16px"><h3 style="margin-top:0">🔁 Hier solltest du nochmal ran</h3><div class="meta" style="display:flex;gap:8px;flex-wrap:wrap">${weak.map(([t, c]) => `<span class="chip warn">${esc(t)} · ${c}× falsch</span>`).join("")}</div></div>` : ""}
+    <div class="card gen-box" style="margin-top:16px">
+      <div><b>Lernmaterial erstellen</b><div class="gen-status" style="margin-top:8px">${statusChips(s)}</div></div>
+      <button class="btn primary" data-gen="summary,quiz,flashcards" ${!s.file_count ? "disabled" : ""}>✨ Alles neu erstellen</button>
+    </div>`;
+  bindGen(s, view);
+}
+
+/* ---------------------------------------------------------------- files */
+function viewFiles(s, view) {
+  view.innerHTML = `
+    <div class="card">
+      <label class="drop" id="drop">
+        <div class="em">📤</div>
+        <b>Dateien hierher ziehen</b>
+        <div class="muted" style="font-size:13px">oder klicken, um sie auszuwählen</div>
+        <div class="types"><span>PDF</span><span>DOCX</span><span>PPTX</span><span>JPG</span><span>PNG</span><span>TXT</span></div>
+        <input type="file" id="fileInput" multiple hidden accept=".pdf,.docx,.pptx,.png,.jpg,.jpeg,.gif,.webp,.txt,.md,.csv,.tex,.html,.htm,.json,.rtf">
+      </label>
+      <div class="file-list" id="fileList"></div>
+      ${s.files.some(f => f.problem) ? `<div class="warn-box">⚠️ Dateien mit Hinweis werden beim Erstellen <b>übersprungen</b> – der Rest wird trotzdem verwendet. Behebe das Problem (siehe Text) und lade die Datei neu hoch, oder lösche sie.</div>` : ""}
+      <div class="gen-box">
+        <div class="gen-status">${statusChips(s)}</div>
+        <button class="btn primary" data-gen="summary,quiz,flashcards" ${!s.file_count ? "disabled" : ""}>✨ Zusammenfassung, Quiz & Karteikarten erstellen</button>
+      </div>
+      ${["summary", "quiz", "flashcards"].map(k => errorBox(s, k)).filter(Boolean)[0] || ""}
+    </div>
+    <p class="muted" style="font-size:13px;margin-top:12px">💡 Tipp: Fotos von Heftseiten und Tafelbildern funktionieren auch – achte auf gute Beleuchtung. Nach neuen Dateien einfach nochmal auf „erstellen“ klicken.</p>`;
+  const list = $("#fileList");
+  const drawFiles = (files) => {
+    list.innerHTML = files.length ? "" : `<div class="muted" style="text-align:center;padding:8px">Noch keine Dateien hochgeladen.</div>`;
+    for (const f of files) {
+      const ext = f.name.includes(".") ? f.name.split(".").pop() : "?";
+      const row = document.createElement("div");
+      row.className = "file" + (f.problem ? " has-problem" : "");
+      row.innerHTML = `<span class="ext">${esc(ext)}</span>
+        <span class="fn"><a href="/api/subjects/${s.id}/files/${encodeURIComponent(f.name)}" target="_blank">${esc(f.name)}</a>
+          ${f.problem ? `<span class="problem">⚠️ Wird übersprungen: ${esc(f.problem)}</span>` : ""}</span>
+        <span class="sz">${fmtSize(f.size)}</span><button class="icon-btn" title="Löschen">✕</button>`;
+      row.querySelector("button").onclick = async () => {
+        const r = await api(`/subjects/${s.id}/files/${encodeURIComponent(f.name)}`, { method: "DELETE" });
+        await loadSubjects(); route();
+      };
+      list.appendChild(row);
+    }
+  };
+  drawFiles(s.files);
+  const upload = async (fileList) => {
+    if (!fileList.length) return;
+    const fd = new FormData();
+    [...fileList].forEach(f => fd.append("files", f));
+    toast("⏫ Lade hoch …");
+    try {
+      const r = await api(`/subjects/${s.id}/files`, { method: "POST", body: fd });
+      toast(r.skipped.length ? `${r.saved.length} hochgeladen, nicht unterstützt: ${r.skipped.join(", ")}`
+        : (r.problems || []).length ? `⚠️ ${r.problems.length} Datei(en) können nicht gelesen werden – siehe Hinweis in der Liste`
+        : `✅ ${r.saved.length} Datei(en) hochgeladen`);
+      await loadSubjects(); route();
+    } catch (e) { toast(e.message); }
+  };
+  const drop = $("#drop");
+  $("#fileInput").onchange = (e) => upload(e.target.files);
+  drop.ondragover = (e) => { e.preventDefault(); drop.classList.add("over"); };
+  drop.ondragleave = () => drop.classList.remove("over");
+  drop.ondrop = (e) => { e.preventDefault(); drop.classList.remove("over"); upload(e.dataTransfer.files); };
+  bindGen(s, view);
+}
+
+/* ---------------------------------------------------------------- summary */
+async function viewSummary(s, view) {
+  const loading = generatingCard(s, "summary");
+  if (loading) { view.innerHTML = loading; return; }
+  const data = await api(`/subjects/${s.id}/content/summary`);
+  if (!data.markdown) {
+    view.innerHTML = emptyState(s, "summary", "📖", "Lass dir von der KI eine Zusammenfassung mit allen Themen und Erklärungen schreiben.");
+    bindGen(s, view); return;
+  }
+  view.innerHTML = `
+    <div class="summary-layout">
+      <div class="card"><article class="md" id="md"></article></div>
+      <aside class="toc" id="toc"></aside>
+    </div>
+    <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:14px">
+      <span class="muted" style="font-size:12px;align-self:center">Erstellt am ${new Date(data.generated * 1000).toLocaleString("de-DE")}</span>
+      <button class="btn sm" id="printBtn">🖨 Drucken</button>
+      <button class="btn sm" data-gen="summary">↻ Neu erstellen</button>
+    </div>${errorBox(s, "summary")}`;
+  const md = renderMd(data.markdown, $("#md"));
+  const toc = $("#toc");
+  const hs = md.querySelectorAll("h2");
+  if (hs.length) {
+    toc.innerHTML = `<div class="tt">Inhalt</div>`;
+    hs.forEach((h, i) => {
+      h.id = "sec" + i;
+      const a = document.createElement("a");
+      a.textContent = h.textContent;
+      a.href = "#";
+      a.onclick = (e) => { e.preventDefault(); h.scrollIntoView({ behavior: "smooth", block: "start" }); };
+      toc.appendChild(a);
+    });
+  }
+  $("#printBtn").onclick = () => {
+    const w = window.open("", "_blank");
+    w.document.write(`<html><head><title>${esc(s.name)}</title><link rel="stylesheet" href="${location.origin}/vendor/katex.min.css">
+      <style>body{font-family:Inter,system-ui,sans-serif;max-width:800px;margin:30px auto;line-height:1.6;color:#111}blockquote{border-left:3px solid #e0a800;margin:10px 0;padding:4px 12px;background:#fff8e1}table{border-collapse:collapse}td,th{border:1px solid #ccc;padding:4px 8px}</style>
+      </head><body>${md.innerHTML}</body></html>`);
+    w.document.close();
+    setTimeout(() => w.print(), 600);
+  };
+  bindGen(s, view);
+}
+
+/* ---------------------------------------------------------------- quiz */
+async function viewQuiz(s, view) {
+  const loading = generatingCard(s, "quiz");
+  if (loading) { view.innerHTML = loading; state.quiz = null; return; }
+  const data = await api(`/subjects/${s.id}/content/quiz`);
+  const qs = data.questions || [];
+  if (!qs.length) {
+    view.innerHTML = emptyState(s, "quiz", "🎯", "Die KI erstellt dir Multiple-Choice-Fragen zu allen Themen – mit Erklärungen.");
+    bindGen(s, view); return;
+  }
+  const topics = [...new Set(qs.map(q => q.topic))];
+  const startScreen = () => {
+    state.quiz = null;
+    view.innerHTML = `<div class="card" style="max-width:640px;margin:0 auto;text-align:center;padding:36px">
+      <div style="font-size:44px">🎯</div><h2 style="margin:6px 0">Quiz: ${esc(s.name)}</h2>
+      <p class="muted">${qs.length} Fragen · ${topics.length} Themen</p>
+      <div style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap;margin:18px 0">
+        <select id="qTopic"><option value="">Alle Themen</option>${topics.map(t => `<option>${esc(t)}</option>`).join("")}</select>
+        <select id="qCount"><option value="10">10 Fragen</option><option value="0" selected>Alle Fragen</option><option value="5">5 Fragen</option></select>
+      </div>
+      <button class="btn primary" id="qStart">Los geht's →</button>
+      <div style="margin-top:24px;display:flex;justify-content:center;gap:10px">
+        <button class="btn sm" data-gen="quiz">↻ Neue Fragen erstellen</button>
+      </div>${errorBox(s, "quiz")}</div>`;
+    $("#qStart").onclick = () => {
+      const t = $("#qTopic").value, c = +$("#qCount").value;
+      let pool = shuffle(qs.filter(q => !t || q.topic === t));
+      if (c) pool = pool.slice(0, c);
+      run(pool);
+    };
+    bindGen(s, view);
+  };
+  const run = (pool) => {
+    // Antwortoptionen mischen, damit die Position nicht auswendig gelernt wird
+    const items = pool.map(q => {
+      const order = shuffle(q.options.map((_, i) => i));
+      return { ...q, options: order.map(i => q.options[i]), correct: order.indexOf(q.correct_index) };
+    });
+    state.quiz = { active: true, items, i: 0, score: 0, wrong: [] };
+    showQ();
+  };
+  const showQ = () => {
+    const Q = state.quiz, q = Q.items[Q.i];
+    view.innerHTML = `<div style="max-width:760px;margin:0 auto">
+      <div class="quiz-top"><span class="muted" style="font-family:'JetBrains Mono',monospace;font-size:13px">${Q.i + 1}/${Q.items.length}</span>
+        <div class="bar"><i style="width:${(Q.i / Q.items.length) * 100}%"></i></div>
+        <span class="chip">✓ ${Q.score}</span><button class="icon-btn" id="qQuit" title="Beenden">✕</button></div>
+      <div class="card">
+        <div class="q-topic">${esc(q.topic)}</div>
+        <div class="q-text">${mdInline(q.question)}</div>
+        <div class="options">${q.options.map((o, i) => `<button class="opt" data-i="${i}"><span class="k">${"ABCDEFGH"[i]}</span><span>${mdInline(o)}</span></button>`).join("")}</div>
+        <div id="explain"></div>
+        <div class="quiz-actions" id="qNextWrap" hidden><button class="btn primary" id="qNext">${Q.i + 1 < Q.items.length ? "Weiter →" : "Ergebnis anzeigen"}</button></div>
+      </div>
+      <p class="muted" style="text-align:center;font-size:12px;margin-top:12px">Tastatur: <kbd>A</kbd>–<kbd>D</kbd> oder <kbd>1</kbd>–<kbd>4</kbd> antworten · <kbd>Enter</kbd> weiter</p></div>`;
+    // Absätze aus Markdown in Buttons entfernen
+    view.querySelectorAll(".opt p, .q-text p").forEach(p => p.replaceWith(...p.childNodes));
+    $("#qQuit").onclick = startScreen;
+    view.querySelectorAll(".opt").forEach(b => (b.onclick = () => answer(+b.dataset.i)));
+    $("#qNext").onclick = next;
+  };
+  const answer = (i) => {
+    const Q = state.quiz, q = Q.items[Q.i];
+    if (Q.answered === Q.i) return;
+    Q.answered = Q.i;
+    const ok = i === q.correct;
+    if (ok) Q.score++; else Q.wrong.push(q);
+    view.querySelectorAll(".opt").forEach((b, j) => {
+      b.disabled = true;
+      if (j === q.correct) b.classList.add("correct");
+      else if (j === i) b.classList.add("wrong");
+    });
+    $("#explain").innerHTML = `<div class="explain"><b class="${ok ? "ok" : "no"}">${ok ? "✓ Richtig!" : "✗ Leider falsch."}</b> ${mdInline(q.explanation)}</div>`;
+    $("#explain").querySelectorAll("p").forEach(p => p.replaceWith(...p.childNodes));
+    if (!ok) {
+      const ask = document.createElement("button");
+      ask.className = "btn sm"; ask.style.marginTop = "10px"; ask.textContent = "💬 Im Chat nachfragen";
+      ask.onclick = () => {
+        state.chatDraft = `Im Quiz kam die Frage: „${q.question}“. Ich habe „${q.options[i]}“ gewählt, richtig ist „${q.options[q.correct]}“. Kannst du mir erklären, warum?`;
+        location.hash = `#/s/${s.id}/chat`;
+      };
+      $("#explain .explain").appendChild(document.createElement("br"));
+      $("#explain .explain").appendChild(ask);
+    }
+    $("#qNextWrap").hidden = false;
+    $("#qNext").focus();
+  };
+  const next = () => {
+    const Q = state.quiz;
+    if (Q.answered !== Q.i) return;
+    if (++Q.i < Q.items.length) showQ(); else finish();
+  };
+  const finish = () => {
+    const Q = state.quiz;
+    Q.active = false;
+    const pct = Math.round((Q.score / Q.items.length) * 100);
+    api(`/subjects/${s.id}/results`, { json: { score: Q.score, total: Q.items.length, wrong_topics: Q.wrong.map(q => q.topic) } }).then(loadSubjects);
+    const C = 2 * Math.PI * 70;
+    const msg = pct >= 90 ? "Hervorragend! Du bist bereit. 🏆" : pct >= 70 ? "Gut gemacht! Noch ein bisschen Feinschliff. 💪" : pct >= 50 ? "Solide Basis – wiederhole die falschen Fragen. 📚" : "Lies dir die Zusammenfassung nochmal durch und versuch's erneut. 🔁";
+    view.innerHTML = `<div class="card" style="max-width:640px;margin:0 auto;text-align:center;padding:36px">
+      <div class="score-ring"><svg width="160" height="160"><circle cx="80" cy="80" r="70" stroke="var(--line)" stroke-width="12" fill="none"/>
+        <circle cx="80" cy="80" r="70" stroke="url(#g)" stroke-width="12" fill="none" stroke-linecap="round" stroke-dasharray="${C}" stroke-dashoffset="${C * (1 - pct / 100)}" style="transition:stroke-dashoffset 1s"/>
+        <defs><linearGradient id="g"><stop offset="0" stop-color="#8b5cf6"/><stop offset="1" stop-color="#22d3ee"/></linearGradient></defs></svg>
+        <div class="v">${pct}%</div></div>
+      <h2 style="margin:0">${Q.score} von ${Q.items.length} richtig</h2><p class="muted">${msg}</p>
+      <div style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap;margin-top:18px">
+        ${Q.wrong.length ? `<button class="btn primary" id="qRetry">🔁 Falsche wiederholen (${Q.wrong.length})</button>` : ""}
+        <button class="btn" id="qAgain">Neues Quiz</button>
+      </div></div>`;
+    const wrongOrig = Q.wrong.map(w => qs.find(q => q.question === w.question)).filter(Boolean);
+    if ($("#qRetry")) $("#qRetry").onclick = () => run(shuffle(wrongOrig));
+    $("#qAgain").onclick = startScreen;
+  };
+  state.quizKeys = (e) => {
+    const Q = state.quiz;
+    if (!Q?.active || document.querySelector("dialog[open]")) return;
+    const k = e.key.toLowerCase();
+    const idx = "abcdefgh".indexOf(k) >= 0 ? "abcdefgh".indexOf(k) : "12345678".indexOf(k);
+    if (idx >= 0 && Q.answered !== Q.i && idx < Q.items[Q.i].options.length) answer(idx);
+    else if (e.key === "Enter" && Q.answered === Q.i) { e.preventDefault(); next(); }
+  };
+  startScreen();
+}
+
+/* ---------------------------------------------------------------- flashcards */
+async function viewFlashcards(s, view) {
+  const loading = generatingCard(s, "flashcards");
+  if (loading) { view.innerHTML = loading; state.fc = null; return; }
+  const data = await api(`/subjects/${s.id}/content/flashcards`);
+  const cards = (data.cards || []).map((c, idx) => ({ ...c, idx }));
+  if (!cards.length) {
+    view.innerHTML = emptyState(s, "flashcards", "🃏", "Die KI macht aus deinem Material Karteikarten zum Auswendiglernen.");
+    bindGen(s, view); return;
+  }
+  const topics = [...new Set(cards.map(c => c.topic))];
+  const fc = state.fc = { active: true, topic: "", mode: "learn", queue: [], cur: null, flipped: false };
+
+  const buildQueue = () => {
+    let pool = cards.filter(c => !fc.topic || c.topic === fc.topic);
+    if (fc.mode === "learn") {
+      // Lernkartei: Karten in niedrigen Fächern zuerst, sichere Karten (Fach 5) nur selten
+      pool = shuffle(pool).sort((a, b) => (a.box || 1) - (b.box || 1));
+      const open = pool.filter(c => (c.box || 1) < 5);
+      pool = open.length ? open : pool;
+    } else pool = shuffle(pool);
+    fc.queue = pool;
+  };
+  const boxCounts = () => {
+    const pool = cards.filter(c => !fc.topic || c.topic === fc.topic);
+    return [1, 2, 3, 4, 5].map(b => pool.filter(c => (c.box || 1) === b).length);
+  };
+  const draw = () => {
+    const bc = boxCounts();
+    const total = bc.reduce((a, b) => a + b, 0);
+    const mastered = bc[3] + bc[4];
+    fc.cur = fc.queue[0];
+    fc.flipped = false;
+    view.innerHTML = `
+      <div class="fc-toolbar">
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <select id="fcTopic"><option value="">Alle Themen (${cards.length})</option>${topics.map(t => `<option ${t === fc.topic ? "selected" : ""}>${esc(t)}</option>`).join("")}</select>
+          <select id="fcMode"><option value="learn" ${fc.mode === "learn" ? "selected" : ""}>Lernkartei-Modus</option><option value="all" ${fc.mode === "all" ? "selected" : ""}>Alle Karten zufällig</option></select>
+        </div>
+        <div style="display:flex;gap:8px"><button class="btn sm" id="fcReset">Fortschritt zurücksetzen</button><button class="btn sm" data-gen="flashcards">↻ Neu erstellen</button></div>
+      </div>
+      <div class="boxes">${bc.map((n, i) => `<span class="chip">Fach ${i + 1}: <b>${n}</b></span>`).join("")}
+        <span class="chip" style="color:var(--good)">${Math.round((mastered / Math.max(1, total)) * 100)}% sicher</span></div>
+      ${fc.cur ? `
+      <div class="fc-wrap">
+        <div class="fc" id="card">
+          <div class="fc-face front"><span class="lbl">Frage</span><span class="tp">${esc(fc.cur.topic)}</span><div class="txt">${mdInline(fc.cur.front)}</div></div>
+          <div class="fc-face back"><span class="lbl">Antwort</span><span class="tp">${esc(fc.cur.topic)}</span><div class="txt">${mdInline(fc.cur.back)}</div></div>
+        </div>
+        <div class="fc-hint" id="fcHint">Klicke auf die Karte oder drücke <kbd>Leertaste</kbd> zum Umdrehen · noch ${fc.queue.length} in dieser Runde</div>
+        <div class="fc-actions" id="fcActions" style="visibility:hidden">
+          <button class="btn bad" id="fcNo">✗ Nochmal <kbd>←</kbd></button>
+          <button class="btn good" id="fcYes">✓ Gewusst <kbd>→</kbd></button>
+        </div>
+      </div>` : `
+      <div class="card empty"><div class="em">🎉</div><h2>Runde geschafft!</h2><p>Du hast alle Karten dieser Runde durch.</p>
+        <button class="btn primary" id="fcAgain">Nächste Runde</button></div>`}
+      ${errorBox(s, "flashcards")}`;
+    $("#fcTopic").onchange = (e) => { fc.topic = e.target.value; buildQueue(); draw(); };
+    $("#fcMode").onchange = (e) => { fc.mode = e.target.value; buildQueue(); draw(); };
+    $("#fcReset").onclick = async () => {
+      if (!confirm("Lernfortschritt aller Karten zurücksetzen?")) return;
+      await api(`/subjects/${s.id}/flashcards/reset`, { json: {} });
+      cards.forEach(c => (c.box = 1));
+      buildQueue(); draw(); loadSubjects();
+    };
+    bindGen(s, view);
+    if (!fc.cur) { $("#fcAgain").onclick = () => { buildQueue(); draw(); }; return; }
+    $("#card").onclick = flip;
+    $("#fcNo").onclick = (e) => { e.stopPropagation(); rate(false); };
+    $("#fcYes").onclick = (e) => { e.stopPropagation(); rate(true); };
+  };
+  const flip = () => {
+    fc.flipped = !fc.flipped;
+    $("#card").classList.toggle("flipped", fc.flipped);
+    if (fc.flipped) $("#fcActions").style.visibility = "visible";
+  };
+  const rate = async (known) => {
+    if (!fc.cur || !fc.flipped) return;
+    const c = fc.cur;
+    fc.queue.shift();
+    if (!known) fc.queue.splice(Math.min(fc.queue.length, 3), 0, c); // bald nochmal zeigen
+    c.box = known ? Math.min(5, (c.box || 1) + 1) : 1;
+    draw();
+    api(`/subjects/${s.id}/flashcards/${c.idx}`, { json: { known } }).catch(() => {});
+  };
+  state.fcKeys = (e) => {
+    if (!state.fc?.active || !fc.cur || document.querySelector("dialog[open]")) return;
+    if (e.target.tagName === "SELECT") return;
+    if (e.key === " ") { e.preventDefault(); flip(); }
+    else if (e.key === "ArrowRight") rate(true);
+    else if (e.key === "ArrowLeft") rate(false);
+  };
+  buildQueue();
+  draw();
+}
+
+/* ---------------------------------------------------------------- router */
+/* ---------------------------------------------------------------- chat */
+const CHAT_SUGGESTIONS = [
+  "Was sind die wichtigsten Themen für die Arbeit?",
+  "Frag mich ab – eine Frage nach der anderen!",
+  "Erklär mir das schwierigste Thema ganz einfach.",
+  "Welche typischen Fehler sollte ich vermeiden?",
+];
+async function viewChat(s, view) {
+  if (!s.file_count) {
+    view.innerHTML = `<div class="card empty"><div class="em">💬</div><h2>Chat mit deinem Lernmaterial</h2>
+      <p>Lade zuerst Dateien hoch – dann kannst du der KI Fragen dazu stellen.</p>
+      <button class="btn primary" onclick="location.hash='#/s/${s.id}/files'">📄 Dateien hochladen</button></div>`;
+    return;
+  }
+  const chat = await api(`/subjects/${s.id}/chat`).catch(() => ({ messages: [] }));
+  view.innerHTML = `
+    <div class="chat card">
+      <div class="chat-head">
+        <div><b>💬 Lern-Chat</b><div class="muted" style="font-size:12px">Die KI kennt alle Dateien aus diesem Fach.</div></div>
+        <button class="btn sm" id="chatNew">＋ Neuer Chat</button>
+      </div>
+      ${chat.outdated ? `<div class="chat-note">📎 Du hast seit Beginn dieses Chats Dateien geändert. Neue Dateien kennt die KI erst in einem <a href="#" id="chatNew2">neuen Chat</a>.</div>` : ""}
+      <div class="chat-log" id="chatLog"></div>
+      <form class="chat-input" id="chatForm">
+        <textarea id="chatText" rows="1" placeholder="Frag etwas zu ${esc(s.name)} …"></textarea>
+        <button class="btn primary" id="chatSend" title="Senden (Enter)">➤</button>
+      </form>
+      <div class="muted chat-hint"><kbd>Enter</kbd> senden · <kbd>Shift</kbd>+<kbd>Enter</kbd> neue Zeile</div>
+    </div>`;
+  const log = $("#chatLog"), ta = $("#chatText"), form = $("#chatForm"), sendBtn = $("#chatSend");
+  const scroll = () => (log.scrollTop = log.scrollHeight);
+  const bubble = (role, text) => {
+    const el = document.createElement("div");
+    el.className = `msg ${role}`;
+    el.innerHTML = `<div class="av">${role === "user" ? "Du" : "◆"}</div><div class="bub md"></div>`;
+    const b = el.querySelector(".bub");
+    if (role === "user") b.textContent = text; else renderMd(text, b);
+    log.appendChild(el);
+    return b;
+  };
+  const drawEmpty = () => {
+    log.innerHTML = `<div class="chat-empty"><div class="em">◆</div><h3>Was möchtest du wissen?</h3>
+      <div class="sugg">${CHAT_SUGGESTIONS.map(t => `<button class="chip-btn">${esc(t)}</button>`).join("")}</div></div>`;
+    log.querySelectorAll(".chip-btn").forEach(b => (b.onclick = () => send(b.textContent)));
+  };
+  if (chat.messages.length) chat.messages.forEach(m => bubble(m.role, m.text)); else drawEmpty();
+  scroll();
+
+  const autosize = () => { ta.style.height = "auto"; ta.style.height = Math.min(ta.scrollHeight, 180) + "px"; };
+  ta.oninput = autosize;
+  ta.onkeydown = (e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); form.requestSubmit(); } };
+  form.onsubmit = (e) => { e.preventDefault(); send(ta.value); };
+  const newChat = async (e) => {
+    e?.preventDefault();
+    if (chat.messages.length && !confirm("Aktuellen Chat löschen und neu anfangen?")) return;
+    await api(`/subjects/${s.id}/chat`, { method: "DELETE" });
+    route();
+  };
+  $("#chatNew").onclick = newChat;
+  if ($("#chatNew2")) $("#chatNew2").onclick = newChat;
+
+  let busy = false;
+  async function send(text) {
+    text = text.trim();
+    if (!text || busy) return;
+    busy = true; sendBtn.disabled = true;
+    log.querySelector(".chat-empty")?.remove();
+    ta.value = ""; autosize();
+    bubble("user", text);
+    const out = bubble("assistant", "");
+    out.innerHTML = `<span class="typing"><i></i><i></i><i></i></span>`;
+    scroll();
+    let acc = "", failed = null;
+    try {
+      const r = await fetch(`/api/subjects/${s.id}/chat`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ message: text }),
+      });
+      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || `Fehler ${r.status}`);
+      const reader = r.body.getReader(), dec = new TextDecoder();
+      let buf = "", pending = false;
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let idx;
+        while ((idx = buf.indexOf("\n\n")) >= 0) {
+          const line = buf.slice(0, idx); buf = buf.slice(idx + 2);
+          if (!line.startsWith("data: ")) continue;
+          const ev = JSON.parse(line.slice(6));
+          if (ev.t) {
+            acc += ev.t;
+            if (!pending) {  // höchstens einmal pro Frame neu rendern
+              pending = true;
+              requestAnimationFrame(() => { pending = false; renderMd(acc, out); scroll(); });
+            }
+          }
+          if (ev.error) failed = ev.error;
+        }
+      }
+      if (!acc && !failed) failed = "Keine Antwort erhalten.";
+    } catch (e) { failed = e.message; }
+    requestAnimationFrame(() => {
+      if (acc) renderMd(acc, out);
+      if (failed) {
+        if (!acc) out.innerHTML = "";
+        out.insertAdjacentHTML("beforeend", `<div class="err">⚠️ ${esc(failed)}</div>`);
+        ta.value = text; autosize();  // Nachricht wurde nicht gespeichert → zum erneuten Senden zurückgeben
+      }
+      scroll();
+    });
+    if (!failed) chat.messages.push({ role: "user", text }, { role: "assistant", text: acc });
+    busy = false; sendBtn.disabled = false; ta.focus();
+  }
+
+  if (state.chatDraft) { ta.value = state.chatDraft; state.chatDraft = null; autosize(); }
+  ta.focus();
+}
+
+/* ---------------------------------------------------------------- router */
+function route() {
+  state.quiz = null; state.fc = null; state.examActive = false;
+  clearInterval(state.examTimer); clearTimeout(state.examPoll);
+  const parts = location.hash.replace(/^#\/?/, "").split("/");
+  if (parts[0] === "s" && parts[1]) renderSubject(parts[1], parts[2], parts[3]);
+  else renderHome();
+}
+document.addEventListener("keydown", (e) => {
+  if (state.quiz?.active && state.quizKeys) state.quizKeys(e);
+  else if (state.fc?.active && state.fcKeys) state.fcKeys(e);
+});
+window.addEventListener("hashchange", route);
+$("#btnNewSubject").onclick = () => openSubjectDialog();
+$("#btnSettings").onclick = () => openSettings();
+document.querySelector("[data-nav=home]").onclick = () => (location.hash = "#/");
+
+(async () => {
+  checkApi();
+  await loadSubjects();
+  route();
+})();
